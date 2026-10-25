@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Literal, Optional
 
+import pandas as pd
 import plotly.io as pio
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -82,6 +83,7 @@ class AgentDecision(BaseModel):
         ),
     )
     target_col: Optional[str] = Field(None, description="Primary column (metric or prediction target) to analyze")
+    cohort_outcome_column: Optional[str] = Field(None, description="Independent outcome column used to evaluate a selected percentile cohort")
     group_col: Optional[str] = Field(None, description="Grouping column or secondary column")
     metric_columns: list[str] = Field(default_factory=list, description="Metric columns for a descriptive summary")
     group_columns: list[str] = Field(default_factory=list, description="Columns by which descriptive summaries should be grouped")
@@ -127,6 +129,24 @@ class DescriptiveSelection(BaseModel):
     )
     count_distinct_items: bool = Field(
         description="Whether duplicate item IDs should count once per entity."
+    )
+
+
+class CohortSelection(BaseModel):
+    """Model-selected ranking and independent outcome columns for a cohort request."""
+
+    ranking_column: Optional[str] = Field(
+        None,
+        description="Exact numeric dataset column that defines performance/rank; null if no suitable measure exists.",
+    )
+    outcome_column: Optional[str] = Field(
+        None,
+        description="Exact independent outcome column for evaluating the cohort; null if no decision-relevant measure exists.",
+    )
+    percentile: float = Field(default=5.0, gt=0, lt=50)
+    direction: Literal["bottom", "top"] = "bottom"
+    rationale: str = Field(
+        description="Briefly explain why these columns represent the user's ranking criterion and an independent outcome.",
     )
 
 
@@ -219,7 +239,7 @@ ROUTE BY USER INTENT — APPLY THESE RULES IN ORDER:
 2. Request for a descriptive quantity (average, count, total, median, min/max, standard deviation, or breakdown by department/group) -> descriptive_statistics. This includes comparisons that ask only for values, such as "give me the average overall and by department". Do not run a hypothesis test just because groups are mentioned. You MUST select at least one exact metric column for column_aggregate mode. A target_col can also be used as the metric, but do not leave both empty.
 3. Request for a chart/plot/visualization -> generate_chart, with chart type and exact dataset columns. If they also explicitly request a hypothesis test, select the test tool and populate the optional chart fields too.
 4. Explicit prediction/classification request about unknown/future outcomes -> train_predictive_model. Select classification or regression from the target's meaning/type and use relevant features. A question asking whether to take an action based on existing evidence is not itself a request to train a predictive model.
-5. A decision, recommendation, or claim about whether a difference/effect/relationship is real or meaningful -> use a hypothesis-test function before drawing a conclusion. Do not route a decision question to ML merely because the prompt mentions a predictive model, model score, or ranking. If the decision is about acting on a top/bottom percentile cohort, select cohort_decision_test and compare the cohort to the rest using a separate, relevant outcome column. Never use the same column both to define and evaluate the cohort. If no independent, decision-relevant outcome column exists, use direct_answer and state that the dataset does not support that inference; do not substitute a predictive model or invent evidence.
+5. A decision, recommendation, or claim about whether a difference/effect/relationship is real or meaningful -> use a hypothesis-test function before drawing a conclusion. Do not route a decision question to ML merely because the prompt mentions a predictive model, model score, or ranking. For any decision about a top/bottom percentile cohort, select cohort_decision_test so the requested cohort can be defined. The focused cohort selector will choose an independent, decision-relevant outcome if one exists; never use the ranking column as its own outcome. If none exists, report the cohort definition and say that a statistical decision cannot be inferred; do not substitute a predictive model or invent evidence.
 6. Purely conceptual/statistical explanation with no dataset calculation -> direct_answer.
 
 SELECT THE HYPOTHESIS TEST FROM COLUMN TYPES AND QUESTION:
@@ -232,7 +252,7 @@ The selected statistical function computes statistics, p-values, confidence inte
 
 AVAILABLE BUILT-IN FUNCTIONS:
 - descriptive_statistics: basic overall/grouped aggregations; also mean_items_per_entity when rows represent items assigned to entities. Always select exact metric_columns for column_aggregate mode. Use mean_items_per_entity only when rows are item-level records that need to be counted per entity. When the dataset has one row per entity and already has a numeric measure for the requested quantity, average that measure with column_aggregate. For that mode identify the entity ID, item ID if present, and grouping columns.
-- cohort_decision_test: numeric ranking column, top/bottom percentile, and an independent outcome column.
+- cohort_decision_test: numeric ranking column and top/bottom percentile; an independent outcome is optional and is needed only to test whether the cohort differs on another decision-relevant measure.
 - compare_groups: numeric outcome and categorical group.
 - correlation: two numeric columns.
 - association: two categorical columns.
@@ -246,7 +266,7 @@ The active dataset is passed only to registered functions. You receive its schem
 ROUTING EXAMPLES (column names below are roles; always substitute exact fields from the active schema):
 A. User asks for an average per entity overall and by category. If each row is one entity and the schema has a numeric measure, use descriptive_statistics with column_aggregate, that measure, mean, and the requested category field. If each row is an item assigned to an entity, use mean_items_per_entity with the entity ID, item ID when available, and requested category field. Decide from schema and row/unique counts. No hypothesis test.
 B. User asks whether a numeric outcome differs significantly across categories. Use compare_groups with the numeric outcome and categorical group field.
-C. User asks whether to act on a top/bottom percentile cohort. Use cohort_decision_test with a continuous ranking field and an independent, decision-relevant outcome. Do not train a model. If there is no suitable independent outcome, choose direct_answer and explain the limitation.
+C. User asks whether to act on a top/bottom percentile cohort. Use cohort_decision_test with the best schema-supported ranking field, percentile, and direction. Select a separate decision-relevant outcome only when one exists. If not, the function still defines the cohort and the response explains the inference limit. Do not train a model.
 D. User asks to predict an unknown outcome. Use train_predictive_model with the target and relevant eligible predictors; choose classification or regression from target meaning/type.
 E. User asks to forecast future values. Use time_series_forecast with the requested numeric target, dataset timestamp, and requested horizon.
 F. User asks for a chart. Use generate_chart with the requested chart form and exact schema fields for axes/grouping/aggregation.
@@ -331,6 +351,96 @@ Prior plan: {decision.model_dump()}
         except Exception as e:
             logger.warning("Planner repair failed; retaining original plan for user-safe validation: %s", e)
 
+    # Cohort requests get their own schema-aware selection pass. Planner
+    # outputs vary between providers/turns; don't let omitted columns become
+    # an execution error (or silently pick a hardcoded measure).
+    if decision.tool == "cohort_decision_test":
+        cohort_prompt = f"""Select fields for a top/bottom percentile cohort analysis from this exact dataset schema.
+The user asks for a cohort definition and/or a decision about that cohort. Select the most relevant numeric ranking field based on the wording and schema. For employee performance, prefer an explicit performance/rating/output measure; never choose an arbitrary ID. Salary, satisfaction, or other measures are not performance rankings unless the user asks for them.
+Choose a separate outcome only if the schema has an independent, decision-relevant outcome for evaluating the cohort. Never use the ranking field itself as the outcome. If there is no suitable ranking field or independent outcome, return null for that field. Null outcome is valid: the app can define the percentile without claiming evidence about the decision.
+Extract the requested percentile (default 5 for 'bottom 5%') and direction. Use exact column names.
+
+User request: {question}
+Dataset rows: {len(df)}
+Exact schema with types and cardinalities:
+{cols_summary}
+
+Initial planner rationale: {decision.thought}
+Return only the structured CohortSelection."""
+        try:
+            cohort_selector = llm.with_structured_output(CohortSelection)
+            selected: CohortSelection = cohort_selector.invoke([
+                SystemMessage(content=cohort_prompt), HumanMessage(content=question)
+            ])
+            rank = _resolve_column(selected.ranking_column, available_cols)
+            outcome = _resolve_column(selected.outcome_column, available_cols)
+            if rank not in available_cols or not pd.api.types.is_numeric_dtype(df[rank]):
+                rank = None
+            if outcome not in available_cols or outcome == rank:
+                outcome = None
+            decision = decision.model_copy(update={
+                "ranking_column": rank,
+                "cohort_outcome_column": outcome,
+                "target_col": outcome,
+                "cohort_percentile": selected.percentile,
+                "cohort_direction": selected.direction,
+                "thought": f"{decision.thought} Cohort selection: {selected.rationale}",
+            })
+        except Exception as e:
+            logger.warning("Focused cohort selection failed; trying planner repair: %s", e)
+
+    if decision.tool == "cohort_decision_test" and (
+        not decision.ranking_column or decision.ranking_column not in available_cols
+        or not pd.api.types.is_numeric_dtype(df[decision.ranking_column])
+    ):
+        numeric_columns = [
+            column for column in available_cols
+            if pd.api.types.is_numeric_dtype(df[column])
+            and data_tools._detect_semantic_type(df[column]) == "numeric"
+        ]
+        repair_prompt = system_prompt + f"""
+
+COHORT PLAN REPAIR REQUIRED:
+The user requested a top/bottom cohort decision. Select an exact numeric ranking_column from the schema that best matches the stated criterion. cohort_outcome_column may be null if no independent relevant outcome exists. Do not select an arbitrary ID or use the ranking column as outcome. Use the requested percentile and direction. Prior plan: {decision.model_dump()}
+"""
+        try:
+            repaired = llm.with_structured_output(AgentDecision).invoke([
+                SystemMessage(content=repair_prompt), HumanMessage(content=question)
+            ])
+            rank = _resolve_column(repaired.ranking_column, available_cols)
+            outcome = _resolve_column(repaired.cohort_outcome_column or repaired.target_col, available_cols)
+            if rank in available_cols and pd.api.types.is_numeric_dtype(df[rank]):
+                if outcome not in available_cols or outcome == rank:
+                    outcome = None
+                decision = decision.model_copy(update={
+                    "ranking_column": rank,
+                    "cohort_outcome_column": outcome,
+                    "target_col": outcome,
+                    "cohort_percentile": repaired.cohort_percentile,
+                    "cohort_direction": repaired.cohort_direction,
+                })
+        except Exception as e:
+            logger.warning("Cohort plan repair failed: %s", e)
+
+    if decision.tool == "cohort_decision_test" and (
+        not decision.ranking_column or decision.ranking_column not in available_cols
+        or not pd.api.types.is_numeric_dtype(df[decision.ranking_column])
+    ):
+        numeric_columns = [
+            column for column in available_cols
+            if pd.api.types.is_numeric_dtype(df[column])
+            and data_tools._detect_semantic_type(df[column]) == "numeric"
+        ]
+        return {
+            "answer": (
+                "I couldn't identify a numeric dataset measure that defines this cohort. "
+                f"Available numeric columns: {', '.join(numeric_columns) or 'none'}. "
+                "Please specify the measure that should rank the cohort."
+            ),
+            "tables": [], "figures": [], "plan": decision.model_dump(),
+            "trace": trace + ["[agent] No valid cohort ranking field was selected."], "code": None,
+        }
+
     if decision.tool == "descriptive_statistics" and _descriptive_plan_is_incomplete(decision, available_cols):
         numeric_columns = [
             column for column in available_cols
@@ -364,18 +474,18 @@ Prior plan: {decision.model_dump()}
     try:
         if decision.tool == "cohort_decision_test":
             ranking_column = _resolve_column(decision.ranking_column, available_cols)
-            if not ranking_column or not target_col:
-                tool_output = {"error": "A cohort test requires both a ranking column and an independent outcome column."}
-            else:
-                tool_output = stats_ml_tools.run_cohort_hypothesis_test(
-                    df,
-                    ranking_column=ranking_column,
-                    outcome_column=target_col,
-                    percentile=decision.cohort_percentile,
-                    direction=decision.cohort_direction,
-                )
-                if tool_output.get("test_result", {}).get("post_hoc"):
-                    tables.append({"title": "Pairwise Post-Hoc Comparisons", "records": tool_output["test_result"]["post_hoc"]})
+            outcome_column = _resolve_column(decision.cohort_outcome_column or target_col, available_cols)
+            if outcome_column not in available_cols or outcome_column == ranking_column:
+                outcome_column = None
+            tool_output = stats_ml_tools.run_cohort_hypothesis_test(
+                df,
+                ranking_column=ranking_column,
+                outcome_column=outcome_column,
+                percentile=decision.cohort_percentile,
+                direction=decision.cohort_direction,
+            )
+            if tool_output.get("test_result", {}).get("post_hoc"):
+                tables.append({"title": "Pairwise Post-Hoc Comparisons", "records": tool_output["test_result"]["post_hoc"]})
 
         elif decision.tool == "descriptive_statistics":
             metric_columns = [
@@ -497,7 +607,7 @@ CRITICAL RULES:
    - **Statistical Test & Evidence**: State the statistical test conducted, test statistic, p-value, effect size, and whether the null hypothesis is rejected or failed to be rejected at alpha = 0.05.
    - **Statistical Significance vs Practical Impact**: Explain whether observed differences are statistically significant or well within expected random variation.
 3. BUSINESS DECISION & RECOMMENDATION:
-   If the user asks whether to make a decision (e.g., 'should we fire them?', 'which strategy should we pick?'), provide a clear, data-backed business recommendation grounded in the statistical test results.
+   If an independent outcome was tested, distinguish statistical evidence from practical judgment and ground the recommendation in the output. If the output only defines a cohort (no independent outcome/test), do not claim a test was run or make a data-backed firing recommendation. State the ranking measure, percentile cutoff, how ties affect cohort size, and what decision-relevant outcome would be needed. A percentile alone is a relative cutoff, not evidence that a person should be terminated.
 4. ALL COLUMNS USED:
    Explicitly list **All Columns Used for This Decision** and what insight each provided.
 

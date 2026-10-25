@@ -542,22 +542,23 @@ def run_cohort_hypothesis_test(
     df: pd.DataFrame,
     *,
     ranking_column: str,
-    outcome_column: str,
+    outcome_column: Optional[str] = None,
     percentile: float = 5.0,
     direction: Literal["bottom", "top"] = "bottom",
     alpha: float = 0.05,
 ) -> dict:
     """Compare a requested percentile cohort with the remaining population.
 
-    The ranking column defines the cohort; a separate outcome column is tested
-    so the inference is not circular. Numeric outcomes use a group comparison,
-    binary outcomes use a two-proportion test, and other categorical outcomes
-    use a test of association.
+    The ranking column defines the cohort. If an independent outcome is
+    supplied, numeric outcomes use a group comparison, binary outcomes use a
+    two-proportion test, and other categorical outcomes use a test of
+    association. Without an outcome this returns the cohort definition only.
     """
-    if ranking_column not in df.columns or outcome_column not in df.columns:
-        missing = [col for col in (ranking_column, outcome_column) if col not in df.columns]
+    required = [ranking_column] + ([outcome_column] if outcome_column else [])
+    if any(col not in df.columns for col in required):
+        missing = [col for col in required if col not in df.columns]
         return {"error": f"Column(s) not found in dataset: {', '.join(missing)}."}
-    if ranking_column == outcome_column:
+    if outcome_column and ranking_column == outcome_column:
         return {"error": "Choose a separate outcome column; testing the column used to rank the cohort would be circular."}
     if not 0 < percentile < 50:
         return {"error": "Percentile must be greater than 0 and less than 50."}
@@ -566,23 +567,62 @@ def run_cohort_hypothesis_test(
     if not pd.api.types.is_numeric_dtype(df[ranking_column]):
         return {"error": f"Ranking column '{ranking_column}' must be numeric."}
 
-    valid = df[[ranking_column, outcome_column]].dropna().copy()
-    if len(valid) < 10:
-        return {"error": f"At least 10 complete rows are required to form and compare cohorts (found {len(valid)})."}
+    ranked = df.loc[df[ranking_column].notna(), [ranking_column]].copy()
+    if ranked.empty:
+        return {"error": f"Ranking column '{ranking_column}' has no non-missing values."}
 
     quantile = percentile / 100 if direction == "bottom" else 1 - percentile / 100
-    threshold = float(valid[ranking_column].quantile(quantile))
+    threshold = float(ranked[ranking_column].quantile(quantile))
     cohort_column = "__analysis_cohort__"
-    while cohort_column in valid.columns:
+    while cohort_column in df.columns:
         cohort_column = f"_{cohort_column}_"
     if direction == "bottom":
-        valid[cohort_column] = np.where(valid[ranking_column] <= threshold, f"Bottom {percentile:g}%", "Remaining")
+        ranked[cohort_column] = np.where(ranked[ranking_column] <= threshold, f"Bottom {percentile:g}%", "Remaining")
     else:
-        valid[cohort_column] = np.where(valid[ranking_column] >= threshold, f"Top {percentile:g}%", "Remaining")
+        ranked[cohort_column] = np.where(ranked[ranking_column] >= threshold, f"Top {percentile:g}%", "Remaining")
 
-    counts = valid[cohort_column].value_counts().to_dict()
+    counts = ranked[cohort_column].value_counts().to_dict()
     if len(counts) != 2:
         return {"error": "The selected percentile did not produce two distinct cohorts; check the ranking column's ties and values."}
+    cohort_label = f"{direction.title()} {percentile:g}%"
+    actual_share = counts.get(cohort_label, 0) / len(ranked) * 100
+
+    base_result = {
+        "analysis": "cohort_hypothesis_test" if outcome_column else "cohort_definition",
+        "ranking_column": ranking_column,
+        "outcome_column": outcome_column,
+        "cohort_direction": direction,
+        "cohort_percentile": percentile,
+        "ranking_threshold": threshold,
+        "definition": (
+            f"{cohort_label} means rows with {ranking_column} "
+            f"{'<=' if direction == 'bottom' else '>='} {threshold:g}."
+        ),
+        "ranked_rows": int(len(ranked)),
+        "cohort_counts": {str(key): int(value) for key, value in counts.items()},
+        "actual_cohort_share_percent": round(actual_share, 2),
+        "ties_may_expand_cohort": bool(not np.isclose(actual_share, percentile)),
+        "selected_test_type": None,
+        "test_result": None,
+    }
+    if not outcome_column:
+        base_result["test_not_run_reason"] = (
+            "No independent decision-relevant outcome column was available; the percentile cohort is defined, "
+            "but this analysis cannot establish whether action on the cohort is justified."
+        )
+        return base_result
+
+    valid = df.loc[df[ranking_column].notna() & df[outcome_column].notna(), [ranking_column, outcome_column]].copy()
+    if len(valid) < 10:
+        base_result["test_not_run_reason"] = f"At least 10 complete rows are required for comparison (found {len(valid)})."
+        return base_result
+    valid[cohort_column] = ranked[cohort_column].reindex(valid.index)
+    valid = valid.dropna(subset=[cohort_column])
+    comparison_counts = valid[cohort_column].value_counts().to_dict()
+    if len(comparison_counts) != 2:
+        base_result["test_not_run_reason"] = "Missing outcome values left too few observations in one cohort to compare."
+        base_result["comparison_counts"] = {str(key): int(value) for key, value in comparison_counts.items()}
+        return base_result
     outcome = valid[outcome_column]
     if pd.api.types.is_numeric_dtype(outcome):
         unique_values = set(outcome.dropna().unique().tolist())
@@ -603,20 +643,13 @@ def run_cohort_hypothesis_test(
             "alpha": alpha,
         },
     )
+    base_result["comparison_counts"] = {str(key): int(value) for key, value in comparison_counts.items()}
     if result.get("error"):
-        return result
-
-    return {
-        "analysis": "cohort_hypothesis_test",
-        "ranking_column": ranking_column,
-        "outcome_column": outcome_column,
-        "cohort_direction": direction,
-        "cohort_percentile": percentile,
-        "ranking_threshold": threshold,
-        "cohort_counts": {str(key): int(value) for key, value in counts.items()},
-        "selected_test_type": test_type,
-        "test_result": result,
-    }
+        base_result["test_not_run_reason"] = result["error"]
+        return base_result
+    base_result["selected_test_type"] = test_type
+    base_result["test_result"] = result
+    return base_result
 
 
 # -------------------------------------------------------------
