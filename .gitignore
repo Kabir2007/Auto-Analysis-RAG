@@ -1,0 +1,41 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets & Environment Variables
+.env
+.env.local
+.env.*.local
+.streamlit/secrets.toml
+
+# Local Application Data & Cache
+workspace/
+*.parquet
+*.csv
+*.xlsx
+*.xls
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+
+# Packaging & Distribution
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor & OS Metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
