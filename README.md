@@ -4,6 +4,8 @@ Auto-Analysis-RAG is a Streamlit application for exploring user-provided CSV and
 
 The application requires a Supabase project for accounts and persistent dataset storage. Each user signs in, uploads their own data, and supplies their own supported LLM API key if they want to use Analysis Chat. The repository includes no sample dataset and no shared/master LLM key.
 
+Website Link: <a href="https://auto-analysis-rag.streamlit.app/"><b>Link →</b></a>
+
 ## What the application does
 
 ### Data & Cleaning
